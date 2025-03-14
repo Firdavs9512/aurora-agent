@@ -4,10 +4,12 @@ import (
 	"aurora-agent/config"
 	"aurora-agent/utils"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
@@ -30,9 +32,10 @@ type AIAgent interface {
 
 // OpenAIAgent implements the AIAgent interface for OpenAI
 type OpenAIAgent struct {
-	client   *openai.Client
-	model    string
-	messages []openai.ChatCompletionMessage
+	client    *openai.Client
+	model     string
+	messages  []openai.ChatCompletionMessage
+	functions []openai.FunctionDefinition
 }
 
 // NewOpenAIAgent creates a new OpenAI agent
@@ -49,6 +52,22 @@ func NewOpenAIAgent(apiKey string) *OpenAIAgent {
 
 	client := openai.NewClient(apiKey)
 
+	// Define functions for the agent
+	terminalFunction := openai.FunctionDefinition{
+		Name:        "execute_terminal_command",
+		Description: "Execute a command in the terminal",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"command": map[string]interface{}{
+					"type":        "string",
+					"description": "The command to execute in the terminal",
+				},
+			},
+			"required": []string{"command"},
+		},
+	}
+
 	return &OpenAIAgent{
 		client: client,
 		model:  openai.GPT4oLatest, // Default model
@@ -58,6 +77,7 @@ func NewOpenAIAgent(apiKey string) *OpenAIAgent {
 				Content: config.SystemPrompt,
 			},
 		},
+		functions: []openai.FunctionDefinition{terminalFunction},
 	}
 }
 
@@ -102,13 +122,14 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 		Content: prompt,
 	})
 
-	// Create a streaming request
+	// Create a streaming request with function calling
 	stream, err := a.client.CreateChatCompletionStream(
 		ctx,
 		openai.ChatCompletionRequest{
-			Model:    a.model,
-			Messages: a.messages,
-			Stream:   true,
+			Model:     a.model,
+			Messages:  a.messages,
+			Stream:    true,
+			Functions: a.functions,
 		},
 	)
 	if err != nil {
@@ -122,6 +143,11 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 	// Ansi buffer
 	ansiBuffer := ""
 
+	// Variables for function calling
+	var functionName string
+	var functionArgs string
+	isFunctionCall := false
+
 	// Stream the response
 	for {
 		response, err := stream.Recv()
@@ -130,6 +156,18 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 		}
 		if err != nil {
 			return fmt.Errorf("stream error: %v", err)
+		}
+
+		// Check for function call
+		if response.Choices[0].Delta.FunctionCall != nil {
+			isFunctionCall = true
+			if response.Choices[0].Delta.FunctionCall.Name != "" {
+				functionName = response.Choices[0].Delta.FunctionCall.Name
+			}
+			if response.Choices[0].Delta.FunctionCall.Arguments != "" {
+				functionArgs += response.Choices[0].Delta.FunctionCall.Arguments
+			}
+			continue
 		}
 
 		// Get the content delta
@@ -170,6 +208,50 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 		fmt.Print(processedBuffer)
 	}
 
+	// Handle function call if present
+	if isFunctionCall && functionName == "execute_terminal_command" {
+		// Parse function arguments
+		var args map[string]string
+		err := json.Unmarshal([]byte(functionArgs), &args)
+		if err != nil {
+			return fmt.Errorf("error parsing function arguments: %v", err)
+		}
+
+		command := args["command"]
+		if command != "" {
+			// Execute the command
+			fmt.Printf("\n\033[33mExecuting command: %s\033[0m\n", command)
+			
+			// Get user's default shell
+			userShell := GetDefaultShell()
+			
+			// Create command
+			cmd := exec.Command(userShell, "-i", "-c", command)
+			
+			// Run command with PTY
+			utils.RunCommandWithPTY(cmd)
+			
+			// Add function call result to messages
+			a.messages = append(a.messages, openai.ChatCompletionMessage{
+				Role:         openai.ChatMessageRoleAssistant,
+				Content:      "",
+				FunctionCall: &openai.FunctionCall{
+					Name:      functionName,
+					Arguments: functionArgs,
+				},
+			})
+			
+			// Add function result message
+			a.messages = append(a.messages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleFunction,
+				Name:    functionName,
+				Content: fmt.Sprintf("Command executed: %s", command),
+			})
+			
+			return nil
+		}
+	}
+
 	// Add assistant response to history
 	a.messages = append(a.messages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
@@ -187,6 +269,19 @@ func (a *OpenAIAgent) Name() string {
 // SetModel sets the OpenAI model to use
 func (a *OpenAIAgent) SetModel(model string) {
 	a.model = model
+}
+
+// GetDefaultShell returns the user's default shell
+func GetDefaultShell() string {
+	// Default to bash if we can't determine the shell
+	shell := "/bin/bash"
+	
+	// Try to get the user's shell from the SHELL environment variable
+	if userShell := os.Getenv("SHELL"); userShell != "" {
+		shell = userShell
+	}
+	
+	return shell
 }
 
 // AgentManager manages different AI agents
