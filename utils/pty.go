@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,19 +12,22 @@ import (
 // ActiveCmd stores the currently active command (for CTRL+C handling)
 var ActiveCmd *exec.Cmd
 
-// RunCommandWithPTY runs a command with PTY to preserve colors
-func RunCommandWithPTY(cmd *exec.Cmd) {
+// RunCommandWithPTY runs a command with PTY to preserve colors and returns the output
+func RunCommandWithPTY(cmd *exec.Cmd) string {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Println("Error:", err)
-		return
+		return fmt.Sprintf("Error executing command: %v", err)
 	}
 	defer ptmx.Close()
 
 	// Store the active process
 	ActiveCmd = cmd
 
-	// Redirect PTY output to terminal
+	// Buffer to collect command output
+	var outputBuffer bytes.Buffer
+
+	// Redirect PTY output to terminal and collect it
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -31,7 +35,10 @@ func RunCommandWithPTY(cmd *exec.Cmd) {
 			if err != nil {
 				break
 			}
+			// Write to stdout
 			os.Stdout.Write(buf[:n])
+			// Also collect in buffer
+			outputBuffer.Write(buf[:n])
 		}
 	}()
 
@@ -40,4 +47,7 @@ func RunCommandWithPTY(cmd *exec.Cmd) {
 
 	// Clear activeCmd after process completes
 	ActiveCmd = nil
+
+	// Return the collected output
+	return outputBuffer.String()
 }

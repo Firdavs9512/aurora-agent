@@ -70,7 +70,7 @@ func NewOpenAIAgent(apiKey string) *OpenAIAgent {
 
 	return &OpenAIAgent{
 		client: client,
-		model:  openai.GPT4oLatest, // Default model
+		model:  openai.GPT4o, // Default model
 		messages: []openai.ChatCompletionMessage{
 			{
 				Role:    openai.ChatMessageRoleSystem,
@@ -202,10 +202,22 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 		}
 	}
 
+	if fullResponse != "" {
+		a.messages = append(a.messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleAssistant,
+			Content: fullResponse,
+		})
+	}
+
+	if fullResponse != "" {
+		fullResponse = ""
+	}
+
 	// Process remaining buffer
 	if ansiBuffer != "" {
 		processedBuffer := utils.ProcessANSICodes(ansiBuffer)
 		fmt.Print(processedBuffer)
+		ansiBuffer = ""
 	}
 
 	// Handle function call if present
@@ -220,34 +232,87 @@ func (a *OpenAIAgent) StreamQuery(prompt string, writer io.Writer) error {
 		command := args["command"]
 		if command != "" {
 			// Execute the command
-			fmt.Printf("\n\033[33mExecuting command: %s\033[0m\n", command)
-			
+			fmt.Printf("\n\033[33mExecuting command:\033[0m \033[32m%s\033[0m\n", command)
+
 			// Get user's default shell
 			userShell := GetDefaultShell()
-			
+
 			// Create command
 			cmd := exec.Command(userShell, "-i", "-c", command)
-			
+
 			// Run command with PTY
-			utils.RunCommandWithPTY(cmd)
-			
+			output := utils.RunCommandWithPTY(cmd)
+
 			// Add function call result to messages
 			a.messages = append(a.messages, openai.ChatCompletionMessage{
-				Role:         openai.ChatMessageRoleAssistant,
-				Content:      "",
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: fmt.Sprintf("Command executed: %s\nOutput:\n%s", command, output),
 				FunctionCall: &openai.FunctionCall{
 					Name:      functionName,
 					Arguments: functionArgs,
 				},
+				Name: functionName,
 			})
-			
-			// Add function result message
-			a.messages = append(a.messages, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleFunction,
-				Name:    functionName,
-				Content: fmt.Sprintf("Command executed: %s", command),
-			})
-			
+
+			// Create a new request to interpret the output
+			interpretCtx, interpretCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer interpretCancel()
+
+			interpretRequest := openai.ChatCompletionRequest{
+				Model:    a.model,
+				Messages: a.messages,
+			}
+
+			// Get the interpretation
+			interpretResponse, err := a.client.CreateChatCompletionStream(interpretCtx, interpretRequest)
+			if err != nil {
+				fmt.Printf("\033[31mError interpreting command output: %v\033[0m\n", err)
+				return nil
+			}
+
+			for {
+				response, err := interpretResponse.Recv()
+				if err == io.EOF {
+					break
+				}
+
+				// Get the content delta
+				content := response.Choices[0].Delta.Content
+				if content != "" {
+					fullResponse += content
+
+					// add to ansi buffer
+					ansiBuffer += content
+
+					// If buffer contains ANSI code
+					if config.AnsiPattern.MatchString(ansiBuffer) {
+						// Buffer has ANSI code, process it
+						processedBuffer := utils.ProcessANSICodes(ansiBuffer)
+						fmt.Print(processedBuffer)
+						ansiBuffer = ""
+					} else if config.AnsiStartPattern.MatchString(ansiBuffer) && len(ansiBuffer) > 30 {
+						// If buffer contains the start of an ANSI code, but not the end
+						// and buffer length is more than 30, process it
+						// This can happen when ANSI code is in incorrect format
+						processedBuffer := utils.ProcessANSICodes(ansiBuffer)
+						fmt.Print(processedBuffer)
+						ansiBuffer = ""
+					} else if len(ansiBuffer) > 20 && !config.AnsiStartPattern.MatchString(ansiBuffer) {
+						// If buffer length is more than 20 and no ANSI code start is found,
+						// process it
+						processedBuffer := utils.ProcessANSICodes(ansiBuffer)
+						fmt.Print(processedBuffer)
+						ansiBuffer = ""
+					}
+				}
+
+				if ansiBuffer != "" {
+					processedBuffer := utils.ProcessANSICodes(ansiBuffer)
+					fmt.Print(processedBuffer)
+					ansiBuffer = ""
+				}
+			}
+
 			return nil
 		}
 	}
@@ -269,19 +334,6 @@ func (a *OpenAIAgent) Name() string {
 // SetModel sets the OpenAI model to use
 func (a *OpenAIAgent) SetModel(model string) {
 	a.model = model
-}
-
-// GetDefaultShell returns the user's default shell
-func GetDefaultShell() string {
-	// Default to bash if we can't determine the shell
-	shell := "/bin/bash"
-	
-	// Try to get the user's shell from the SHELL environment variable
-	if userShell := os.Getenv("SHELL"); userShell != "" {
-		shell = userShell
-	}
-	
-	return shell
 }
 
 // AgentManager manages different AI agents
